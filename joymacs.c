@@ -79,82 +79,59 @@ joymacs_close(emacs_env *env, ptrdiff_t n, emacs_value *args, void *ptr)
     return S("nil");
 }
 
-
 static emacs_value
-joymacs_read (emacs_env *env, ptrdiff_t nargs,
-              emacs_value *args, void *data)
+joymacs_read(emacs_env *env, ptrdiff_t n, emacs_value *args, void *ptr)
 {
-  (void)nargs;
-  (void)data;
+    (void)n;
+    (void)ptr;
 
-  int fd = (intptr_t)env->get_user_ptr (env, args[0]);
+    int fd = (intptr_t)env->get_user_ptr(env, args[0]);
+    if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+        return S("nil");
 
-  /*  If a non-local exit is already pending, propagate it.  */
-  if (env->non_local_exit_check (env) != emacs_funcall_exit_return)
-    return S ("nil");
+    struct js_event e, latest;
+    int have_event = 0;
 
-  struct js_event  ev;         /* buffer for each read                */
-  struct js_event  latest;     /* last event we have seen             */
-  int              have_event = 0;
-
-  /* -------------------------------------------------------------- */
-  /* Drain the queue.  Keep only the latest event we read.          */
-  /* -------------------------------------------------------------- */
-  for (;;)
-    {
-      ssize_t r = read (fd, &ev, sizeof ev);
-
-      if (r == sizeof ev)
-        {
-          latest     = ev;
-          have_event = 1;      /* remember that we have something     */
-          continue;            /* try to read an even newer one       */
+    /* Drain the queue so that we keep only the newest event.  */
+    for (;;) {
+        int r = read(fd, &e, sizeof(e));
+        if (r == -1) {
+            if (errno == EAGAIN)         /* No more events pending.  */
+                break;
+            /* Real read error (device unplugged, etc.).  */
+            emacs_value signal  = env->intern(env, "file-error");
+            const char *error   = strerror(errno);
+            emacs_value message = env->make_string(env, error, strlen(error));
+            env->non_local_exit_signal(env, signal, message);
+            return S("nil");
+        } else if (r == sizeof(e)) {
+            latest     = e;              /* Keep overwriting -> newest event. */
+            have_event = 1;
         }
-
-      if (r == -1 && errno == EAGAIN)
-        break;                 /* queue exhausted – stop looping      */
-
-      if (r == -1)             /* real I/O error                      */
-        {
-          emacs_value Qfile_error = env->intern (env, "file-error");
-          const char *msg         = strerror (errno);
-          emacs_value message     =
-            env->make_string (env, msg, strlen (msg));
-          env->non_local_exit_signal (env, Qfile_error, message);
-          return S ("nil");
-        }
-
-      /* Short read (should not happen).  Ignore and continue. */
+        /* Any partial read (shouldn’t happen) is ignored and we loop again. */
     }
 
-  /* No events at all.  */
-  if (!have_event)
-    return S ("nil");
+    if (!have_event)                     /* Queue was empty.  */
+        return S("nil");
 
-  /* -------------------------------------------------------------- */
-  /* Build the value to return, using the *latest* event.           */
-  /* -------------------------------------------------------------- */
-  emacs_value v = args[1];             /* caller-supplied vector     */
+    /* Fill out event vector with the latest event.  */
+    emacs_value v      = args[1];
+    emacs_value button = S(":button");
+    emacs_value type   = latest.type & JS_EVENT_BUTTON ? button : S(":axis");
+    emacs_value value;
 
-  emacs_value Qbutton = S (":button");
-  emacs_value Qtype   = (latest.type & JS_EVENT_BUTTON)
-                        ? Qbutton : S (":axis");
+    if (type == button)
+        value = latest.value ? S("t") : S("nil");
+    else
+        value = env->make_float(env, latest.value / (double)INT16_MAX);
 
-  emacs_value Qvalue;
-  if (Qtype == Qbutton)
-    Qvalue = latest.value ? S ("t") : S ("nil");
-  else
-    Qvalue = env->make_float (env,
-                              latest.value / (double) INT16_MAX);
+    env->vec_set(env, v, 0, env->make_integer(env, latest.time));
+    env->vec_set(env, v, 1, type);
+    env->vec_set(env, v, 2, value);
+    env->vec_set(env, v, 3, env->make_integer(env, latest.number));
+    env->vec_set(env, v, 4, latest.type & JS_EVENT_INIT ? S("t") : S("nil"));
 
-  env->vec_set (env, v, 0, env->make_integer (env, latest.time));
-  env->vec_set (env, v, 1, Qtype);
-  env->vec_set (env, v, 2, Qvalue);
-  env->vec_set (env, v, 3, env->make_integer (env, latest.number));
-  env->vec_set (env, v, 4,
-                (latest.type & JS_EVENT_INIT) ? S ("t") : S ("nil"));
-
-  return v;                     /* return the vector with fresh data  */
+    return args[1];
 }
 
 #elif defined(__WIN32__)
